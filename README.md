@@ -23,11 +23,11 @@ Windows 操作系统（打包后的 .exe 文件适用于 Windows）。
 安装依赖
 1. 安装依赖（使用国内镜像源）
 本程序依赖 Pillow 和 numpy 库，使用以下一条命令通过国内镜像源安装：
-pip install Pillow numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install pillow numpy opencv-python pyinstaller -i https://mirrors.aliyun.com/pypi/simple/
 
 2. 安装 PyInstaller（使用国内镜像源）
 PyInstaller 用于将 Python 脚本打包为 .exe 文件，使用以下命令安装：
-pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install pyinstaller -i https://mirrors.aliyun.com/pypi/simple/
 
 打包命令
 将程序打包为一个单独的 .exe 文件，使用以下命令：

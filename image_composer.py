@@ -7,6 +7,13 @@ import time
 import numpy as np
 import colorsys
 
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+    print("OpenCV not available, falling back to NumPy implementation.")
+
 class ImageComposer:
     def __init__(self, root):
         self.root = root
@@ -28,6 +35,10 @@ class ImageComposer:
         self.scale_factor = 1.0
         self.photo_layer_id = None
         self.stamp_layers = {}
+        self.image_cache = {}  # 图像处理缓存
+        self.drag_update_timer = None  # 拖动防抖定时器
+        self.resize_update_timer = None  # 窗口调整防抖定时器
+        self.max_stamps = 10  # 最大图章数量限制
 
         # Set main window size and center it
         window_width = 250
@@ -110,6 +121,7 @@ class ImageComposer:
                 self.selected_stamp = None
                 self.photo_layer_id = None
                 self.stamp_layers.clear()
+                self.image_cache.clear()
 
             self.edit_window.protocol("WM_DELETE_WINDOW", on_edit_window_close)
 
@@ -183,6 +195,9 @@ class ImageComposer:
 
     def delete_stamp(self):
         if self.selected_stamp:
+            cache_keys = [k for k in self.image_cache.keys() if k[0] == self.selected_stamp["id"]]
+            for k in cache_keys:
+                del self.image_cache[k]
             self.stamps.remove(self.selected_stamp)
             self.selected_stamp = None
             self.update_canvas()
@@ -194,6 +209,7 @@ class ImageComposer:
         if self.photo_layer_id:
             self.canvas.delete(self.photo_layer_id)
 
+        # 固定底图位置为 (0, 0)，并确保其在最底层
         self.photo_layer_id = self.canvas.create_image(0, 0, image=self.photo_tk, anchor="nw", tags="photo")
         self.canvas.tag_lower(self.photo_layer_id)
 
@@ -234,6 +250,10 @@ class ImageComposer:
             self.update_canvas()
 
     def import_stamp(self):
+        if len(self.stamps) >= self.max_stamps:
+            messagebox.showwarning("警告", f"图章数量已达上限（{self.max_stamps}个）！")
+            return
+
         stamp_path = filedialog.askopenfilename(filetypes=[("图片", "*.jpg *.jpeg *.png")])
         if not stamp_path:
             return
@@ -300,11 +320,10 @@ class ImageComposer:
 
         x, y = event.x / self.scale_factor, event.y / self.scale_factor
 
-        if not hasattr(self, 'in_drag_mode') or not self.in_drag_mode:
+        if not self.in_drag_mode:
             self.in_drag_mode = True
-            if self.selected_stamp:
-                self.selected_stamp["_temp_blend"] = self.selected_stamp.get("blend_mode", "正片叠底")
-                self.selected_stamp["blend_mode"] = "正常"
+            self.selected_stamp["_temp_blend"] = self.selected_stamp.get("blend_mode", "正片叠底")
+            self.selected_stamp["blend_mode"] = "正常"
 
         old_x = self.selected_stamp["x"]
         old_y = self.selected_stamp["y"]
@@ -326,15 +345,17 @@ class ImageComposer:
             if layer_id:
                 self.canvas.move(layer_id, delta_x, delta_y)
                 self.canvas.move("selection", delta_x, delta_y)
-            else:
-                self.update_stamp(self.selected_stamp)
 
         self.update_selection_rectangle()
 
+        # 防抖更新画布
+        if hasattr(self, 'drag_update_timer'):
+            self.canvas.after_cancel(self.drag_update_timer)
+        self.drag_update_timer = self.canvas.after(100, self.update_canvas)
+
     def stop_drag(self, event):
         self.is_dragging = False
-
-        if hasattr(self, 'in_drag_mode') and self.in_drag_mode:
+        if self.in_drag_mode:
             self.in_drag_mode = False
             if self.selected_stamp and "_temp_blend" in self.selected_stamp:
                 self.selected_stamp["blend_mode"] = self.selected_stamp["_temp_blend"]
@@ -348,11 +369,9 @@ class ImageComposer:
             if stamp_image.mode != 'RGBA':
                 stamp_image = stamp_image.convert('RGBA')
 
-            if base_image.size != stamp_image.size:
-                base_image = base_image.resize(stamp_image.size, Image.LANCZOS)
-
+            # 确保底图区域和图章尺寸匹配
             base_arr = np.array(base_image, dtype=np.float32)
-            stamp_arr = np.array(stamp_image, dtype=np.float32)
+            stamp_arr = np.array(stamp_image.resize(base_image.size, Image.LANCZOS), dtype=np.float32)
 
             base_rgb = base_arr[:, :, :3]
             stamp_rgb = stamp_arr[:, :, :3]
@@ -393,122 +412,82 @@ class ImageComposer:
         return result
 
     def improved_overlay_blend(self, base_image, stamp_image, paste_x, paste_y, opacity=1.0):
-        import numpy as np
-
         if base_image.mode != 'RGBA':
             base_image = base_image.convert('RGBA')
         if stamp_image.mode != 'RGBA':
             stamp_image = stamp_image.convert('RGBA')
 
         result = base_image.copy()
-        result_arr = np.array(result)
+        result_arr = np.array(result, dtype=np.uint8)
 
         stamp_width, stamp_height = stamp_image.size
         max_x = min(paste_x + stamp_width, base_image.width)
         max_y = min(paste_y + stamp_height, base_image.height)
 
+        stamp_arr = np.array(stamp_image, dtype=np.float32)
         for y in range(paste_y, max_y):
             for x in range(paste_x, max_x):
                 if 0 <= x < base_image.width and 0 <= y < base_image.height:
                     sx, sy = x - paste_x, y - paste_y
                     if 0 <= sx < stamp_width and 0 <= sy < stamp_height:
-                        base_pixel = base_image.getpixel((x, y))
-                        stamp_pixel = stamp_image.getpixel((sx, sy))
+                        base_pixel = result_arr[y, x]
+                        stamp_pixel = stamp_arr[sy, sx]
 
-                        if len(stamp_pixel) == 4:
-                            r1, g1, b1, a1 = base_pixel
-                            r2, g2, b2, a2 = stamp_pixel
+                        r1, g1, b1 = base_pixel[:3]
+                        r2, g2, b2, a2 = stamp_pixel
 
-                            if a2 == 0:
-                                continue
+                        if a2 == 0:
+                            continue
 
-                            alpha = a2 / 255.0 * opacity
+                        alpha = a2 / 255.0 * opacity
+                        if alpha > 0:
+                            r = r1 * r2 / 128 if r1 < 128 else 255 - (255 - r1) * (255 - r2) / 128
+                            g = g1 * g2 / 128 if g1 < 128 else 255 - (255 - g1) * (255 - g2) / 128
+                            b = b1 * b2 / 128 if b1 < 128 else 255 - (255 - b1) * (255 - b2) / 128
 
-                            if alpha > 0:
-                                if r1 < 128:
-                                    r = (r1 * r2) / 128
-                                else:
-                                    r = 255 - (255 - r1) * (255 - r2) / 128
-                                if g1 < 128:
-                                    g = (g1 * g2) / 128
-                                else:
-                                    g = 255 - (255 - g1) * (255 - g2) / 128
-                                if b1 < 128:
-                                    b = (b1 * b2) / 128
-                                else:
-                                    b = 255 - (255 - b1) * (255 - b2) / 128
-
-                                r = int(r1 * (1 - alpha) + r * alpha)
-                                g = int(g1 * (1 - alpha) + g * alpha)
-                                b = int(b1 * (1 - alpha) + b * alpha)
-
-                                r = max(0, min(255, r))
-                                g = max(0, min(255, g))
-                                b = max(0, min(255, b))
-
-                                result_arr[y, x, 0] = r
-                                result_arr[y, x, 1] = g
-                                result_arr[y, x, 2] = b
+                            result_arr[y, x, 0] = int(r1 * (1 - alpha) + r * alpha)
+                            result_arr[y, x, 1] = int(g1 * (1 - alpha) + g * alpha)
+                            result_arr[y, x, 2] = int(b1 * (1 - alpha) + b * alpha)
 
         return Image.fromarray(result_arr)
 
     def improved_soft_light_blend(self, base_image, stamp_image, paste_x, paste_y, opacity=1.0):
-        import numpy as np
-
         if base_image.mode != 'RGBA':
             base_image = base_image.convert('RGBA')
         if stamp_image.mode != 'RGBA':
             stamp_image = stamp_image.convert('RGBA')
 
         result = base_image.copy()
-        result_arr = np.array(result)
+        result_arr = np.array(result, dtype=np.uint8)
 
         stamp_width, stamp_height = stamp_image.size
         max_x = min(paste_x + stamp_width, base_image.width)
         max_y = min(paste_y + stamp_height, base_image.height)
 
+        stamp_arr = np.array(stamp_image, dtype=np.float32)
         for y in range(paste_y, max_y):
             for x in range(paste_x, max_x):
                 if 0 <= x < base_image.width and 0 <= y < base_image.height:
                     sx, sy = x - paste_x, y - paste_y
                     if 0 <= sx < stamp_width and 0 <= sy < stamp_height:
-                        base_pixel = base_image.getpixel((x, y))
-                        stamp_pixel = stamp_image.getpixel((sx, sy))
+                        base_pixel = result_arr[y, x]
+                        stamp_pixel = stamp_arr[sy, sx]
 
-                        if len(stamp_pixel) == 4:
-                            r1, g1, b1, a1 = base_pixel
-                            r2, g2, b2, a2 = stamp_pixel
+                        r1, g1, b1 = base_pixel[:3]
+                        r2, g2, b2, a2 = stamp_pixel
 
-                            if a2 == 0:
-                                continue
+                        if a2 == 0:
+                            continue
 
-                            alpha = a2 / 255.0 * opacity
+                        alpha = a2 / 255.0 * opacity
+                        if alpha > 0:
+                            r = r1 * (r2 / 128.0) if r2 < 128 else r1 + (255 - r1) * (r2 - 128) / 128.0
+                            g = g1 * (g2 / 128.0) if g2 < 128 else g1 + (255 - g1) * (g2 - 128) / 128.0
+                            b = b1 * (b2 / 128.0) if b2 < 128 else b1 + (255 - b1) * (b2 - 128) / 128.0
 
-                            if alpha > 0:
-                                if r2 < 128:
-                                    r = r1 * (r2 / 128.0)
-                                else:
-                                    r = r1 + (255 - r1) * (r2 - 128) / 128.0
-                                if g2 < 128:
-                                    g = g1 * (g2 / 128.0)
-                                else:
-                                    g = g1 + (255 - g1) * (g2 - 128) / 128.0
-                                if b2 < 128:
-                                    b = b1 * (b2 / 128.0)
-                                else:
-                                    b = b1 + (255 - b1) * (b2 - 128) / 128.0
-
-                                r = int(r1 * (1 - alpha) + r * alpha)
-                                g = int(g1 * (1 - alpha) + g * alpha)
-                                b = int(b1 * (1 - alpha) + b * alpha)
-
-                                r = max(0, min(255, r))
-                                g = max(0, min(255, g))
-                                b = max(0, min(255, b))
-
-                                result_arr[y, x, 0] = r
-                                result_arr[y, x, 1] = g
-                                result_arr[y, x, 2] = b
+                            result_arr[y, x, 0] = int(r1 * (1 - alpha) + r * alpha)
+                            result_arr[y, x, 1] = int(g1 * (1 - alpha) + g * alpha)
+                            result_arr[y, x, 2] = int(b1 * (1 - alpha) + b * alpha)
 
         return Image.fromarray(result_arr)
 
@@ -516,18 +495,40 @@ class ImageComposer:
         if 0.95 <= factor <= 1.05:
             return image.copy()
 
+        if OPENCV_AVAILABLE:
+            try:
+                # 转换为 OpenCV 格式 (BGR)
+                img_np = np.array(image)
+                img_bgr = img_np[:, :, [2, 1, 0, 3]]  # RGBA to BGRA
+                img_bgr = img_bgr[:, :, :3]  # Remove alpha channel
+
+                # Convert to HSV
+                img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+                img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * factor, 0, 255)  # Adjust saturation
+
+                # Convert back to BGR
+                img_bgr = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+                # Restore RGBA
+                img_rgba = np.zeros_like(img_np)
+                img_rgba[:, :, [2, 1, 0]] = img_bgr
+                img_rgba[:, :, 3] = img_np[:, :, 3]  # Restore alpha channel
+
+                return Image.fromarray(img_rgba)
+            except Exception as e:
+                print(f"Error in enhance_saturation (OpenCV): {e}")
+                # Fall back to NumPy implementation
+                pass
+
+        # NumPy implementation as fallback
         if image.mode != 'RGBA':
             image = image.convert('RGBA')
 
         r, g, b, a = image.split()
 
-        r_arr = np.array(r, dtype=np.float32)
-        g_arr = np.array(g, dtype=np.float32)
-        b_arr = np.array(b, dtype=np.float32)
-
-        r_arr = r_arr / 255.0
-        g_arr = g_arr / 255.0
-        b_arr = b_arr / 255.0
+        r_arr = np.array(r, dtype=np.float32) / 255.0
+        g_arr = np.array(g, dtype=np.float32) / 255.0
+        b_arr = np.array(b, dtype=np.float32) / 255.0
 
         h_arr = np.zeros_like(r_arr)
         s_arr = np.zeros_like(r_arr)
@@ -548,17 +549,28 @@ class ImageComposer:
                     h_arr[i, j], s_arr[i, j], v_arr[i, j]
                 )
 
-        r_arr = np.clip(r_arr * 255, 0, 255).astype(np.uint8)
-        g_arr = np.clip(g_arr * 255, 0, 255).astype(np.uint8)
-        b_arr = np.clip(b_arr * 255, 0, 255).astype(np.uint8)
-
-        r_new = Image.fromarray(r_arr)
-        g_new = Image.fromarray(g_arr)
-        b_new = Image.fromarray(b_arr)
+        r_new = Image.fromarray(np.clip(r_arr * 255, 0, 255).astype(np.uint8))
+        g_new = Image.fromarray(np.clip(g_arr * 255, 0, 255).astype(np.uint8))
+        b_new = Image.fromarray(np.clip(b_arr * 255, 0, 255).astype(np.uint8))
 
         return Image.merge('RGBA', (r_new, g_new, b_new, a))
 
     def process_stamp_image(self, stamp):
+        cache_key = (
+            stamp["id"],
+            stamp["x"],  # 添加位置信息以区分不同图章
+            stamp["y"],
+            stamp["scale"],
+            stamp["opacity"],
+            stamp["brightness"],
+            stamp["saturation"],
+            stamp["rotation"],
+            stamp.get("blend_mode", "正片叠底")
+        )
+
+        if cache_key in self.image_cache:
+            return self.image_cache[cache_key]
+
         img = stamp["image"]
         scale = stamp["scale"] * self.scale_factor
         opacity = stamp["opacity"]
@@ -568,14 +580,26 @@ class ImageComposer:
         blend_mode = stamp.get("blend_mode", "正片叠底")
 
         processed = img.copy()
+        original_size = processed.size  # 保存原始尺寸
+
         if brightness != 1.0:
             processed = ImageEnhance.Brightness(processed).enhance(brightness)
         if saturation != 1.0:
             processed = self.enhance_saturation(processed, saturation)
-        if rotation != 0:
-            processed = processed.rotate(rotation, expand=True, resample=Image.BICUBIC)
 
-        w, h = processed.size
+        if rotation != 0:
+            # Create a transparent canvas to preserve alpha after rotation
+            rotated = processed.rotate(rotation, expand=True, resample=Image.BICUBIC)
+            new_size = rotated.size
+            transparent_canvas = Image.new('RGBA', new_size, (0, 0, 0, 0))
+            paste_x = (new_size[0] - processed.size[0]) // 2
+            paste_y = (new_size[1] - processed.size[1]) // 2
+            transparent_canvas.paste(processed, (paste_x, paste_y), processed)
+            processed = transparent_canvas.rotate(rotation, expand=True, resample=Image.BICUBIC)
+        else:
+            new_size = original_size
+
+        w, h = new_size
         new_w = int(w * scale)
         new_h = int(h * scale)
 
@@ -585,23 +609,22 @@ class ImageComposer:
             return processed
 
         if blend_mode == "正片叠底":
-            photo_region = self.get_photo_region_under_stamp(stamp)
+            photo_region = self.get_photo_region_under_stamp(stamp, processed.size)
             if photo_region:
                 processed = self.multiply_blend(photo_region, processed, opacity)
         else:
             processed = self.apply_opacity(processed, opacity)
 
+        self.image_cache[cache_key] = processed
         return processed
 
-    def get_photo_region_under_stamp(self, stamp):
+    def get_photo_region_under_stamp(self, stamp, processed_size):
         try:
             x = stamp["x"] * self.scale_factor
             y = stamp["y"] * self.scale_factor
-            scale = stamp["scale"] * self.scale_factor
 
-            w, h = stamp["image"].size
-            new_w = int(w * scale)
-            new_h = int(h * scale)
+            # 使用旋转后的图章尺寸计算底图区域
+            new_w, new_h = processed_size
 
             left = max(0, int(x - new_w / 2))
             top = max(0, int(y - new_h / 2))
@@ -620,9 +643,11 @@ class ImageComposer:
             img = stamp["image"]
             x = stamp["x"] * self.scale_factor
             y = stamp["y"] * self.scale_factor
-            scale = stamp["scale"]
 
             processed = self.process_stamp_image(stamp)
+
+            if "tk_image" in stamp:
+                del stamp["tk_image"]
 
             tk_img = ImageTk.PhotoImage(processed)
             stamp["tk_image"] = tk_img
@@ -682,7 +707,13 @@ class ImageComposer:
 
     def update_canvas(self):
         self.canvas.delete("stamp", "selection")
+        for stamp in self.stamps:
+            if "tk_image" in stamp:
+                del stamp["tk_image"]
         self.stamp_layers.clear()
+
+        # 确保底图始终被重绘
+        self.update_canvas_photo()
 
         for stamp in self.stamps:
             self.draw_stamp(stamp)
@@ -701,7 +732,6 @@ class ImageComposer:
 
         self.adjust_window = Toplevel(self.edit_window)
         self.adjust_window.title("调整章图")
-        # 让窗口居中显示
         window_width = 350
         window_height = 550
         screen_width = self.adjust_window.winfo_screenwidth()
@@ -728,25 +758,25 @@ class ImageComposer:
 
         tk.Label(self.adjust_window, text="亮度", font=("Arial", 10, "bold")).pack()
         self.brightness_var = tk.DoubleVar(value=self.stamps[0]["brightness"] * 100)
-        brightness_scale = tk.Scale(self.adjust_window, from_=0, to=200, orient="horizontal", 
+        brightness_scale = tk.Scale(self.adjust_window, from_=0, to=200, orient="horizontal",
                                     variable=self.brightness_var, resolution=1)
         brightness_scale.pack(fill="x", padx=10)
 
         tk.Label(self.adjust_window, text="透明度", font=("Arial", 10, "bold")).pack()
         self.opacity_var = tk.DoubleVar(value=self.stamps[0]["opacity"] * 100)
-        opacity_scale = tk.Scale(self.adjust_window, from_=0, to=100, orient="horizontal", 
+        opacity_scale = tk.Scale(self.adjust_window, from_=0, to=100, orient="horizontal",
                                  variable=self.opacity_var, resolution=1)
         opacity_scale.pack(fill="x", padx=10)
 
         tk.Label(self.adjust_window, text="饱和度", font=("Arial", 10, "bold")).pack()
         self.saturation_var = tk.DoubleVar(value=self.stamps[0]["saturation"] * 100)
-        saturation_scale = tk.Scale(self.adjust_window, from_=0, to=400, orient="horizontal", 
+        saturation_scale = tk.Scale(self.adjust_window, from_=0, to=400, orient="horizontal",
                                     variable=self.saturation_var, resolution=1)
         saturation_scale.pack(fill="x", padx=10)
 
         tk.Label(self.adjust_window, text="旋转", font=("Arial", 10, "bold")).pack()
         self.rotation_var = tk.DoubleVar(value=self.stamps[0]["rotation"])
-        rotation_scale = tk.Scale(self.adjust_window, from_=0, to=359, orient="horizontal", 
+        rotation_scale = tk.Scale(self.adjust_window, from_=0, to=359, orient="horizontal",
                                   variable=self.rotation_var, resolution=1)
         rotation_scale.pack(fill="x", padx=10)
 
@@ -829,7 +859,6 @@ class ImageComposer:
             defaultextension=".png",
             filetypes=[("PNG图像", "*.png"), ("JPEG图像", "*.jpg"), ("所有文件", "*.*")]
         )
-
         if not save_path:
             return
 
@@ -850,14 +879,24 @@ class ImageComposer:
                 blend_mode = stamp.get("blend_mode", "正片叠底")
 
                 processed = img.copy()
+                original_size = processed.size
+
                 if brightness != 1.0:
                     processed = ImageEnhance.Brightness(processed).enhance(brightness)
                 if saturation != 1.0:
                     processed = self.enhance_saturation(processed, saturation)
                 if rotation != 0:
-                    processed = processed.rotate(rotation, expand=True, resample=Image.BICUBIC)
+                    rotated = processed.rotate(rotation, expand=True, resample=Image.BICUBIC)
+                    new_size = rotated.size
+                    transparent_canvas = Image.new('RGBA', new_size, (0, 0, 0, 0))
+                    paste_x = (new_size[0] - processed.size[0]) // 2
+                    paste_y = (new_size[1] - processed.size[1]) // 2
+                    transparent_canvas.paste(processed, (paste_x, paste_y), processed)
+                    processed = transparent_canvas.rotate(rotation, expand=True, resample=Image.BICUBIC)
+                else:
+                    new_size = original_size
 
-                w, h = processed.size
+                w, h = new_size
                 new_w = int(w * scale * base_size[0] / self.original_photo_size[0])
                 new_h = int(h * scale * base_size[0] / self.original_photo_size[0])
 
