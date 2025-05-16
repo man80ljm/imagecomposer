@@ -1,0 +1,15 @@
+忽略 dist 文件夹（PyInstaller 打包生成的文件）
+
+dist/
+
+忽略 venv 文件夹（虚拟环境）
+
+venv/
+
+忽略所有 pycache 缓存文件
+
+pycache/ *.pyc *.pyo *.pyd
+
+忽略 PyInstaller 临时文件
+
+*.spec build/
